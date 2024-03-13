@@ -1,0 +1,357 @@
+From f36519078bde3cce4328c03fffccb846121fb5bc Mon Sep 17 00:00:00 2001
+From: Petr Viktorin <encukou@gmail.com>
+Date: Wed, 9 Aug 2023 20:23:03 +0200
+Subject: [PATCH] Fix symlink handling for tarfile.data_filter
+
+---
+ Doc/library/tarfile.rst  |  5 +++++
+ Lib/tarfile.py           |  9 ++++++++-
+ Lib/test/test_tarfile.py | 26 ++++++++++++++++++++++++--
+ 3 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/Doc/library/tarfile.rst b/Doc/library/tarfile.rst
+index 00f3070324e..e0511bfeb64 100644
+--- a/Doc/library/tarfile.rst
++++ b/Doc/library/tarfile.rst
+@@ -740,6 +740,11 @@ A ``TarInfo`` object has the following public data attributes:
+    Name of the target file name, which is only present in :class:`TarInfo` objects
+    of type :const:`LNKTYPE` and :const:`SYMTYPE`.
+ 
++   For symbolic links (``SYMTYPE``), the linkname is relative to the directory
++   that contains the link.
++   For hard links (``LNKTYPE``), the linkname is relative to the root of
++   the archive.
++
+ 
+ .. attribute:: TarInfo.uid
+    :type: int
+diff --git a/Lib/tarfile.py b/Lib/tarfile.py
+index df4e41f7a0d..d62323715b4 100755
+--- a/Lib/tarfile.py
++++ b/Lib/tarfile.py
+@@ -802,7 +802,14 @@ def _get_filtered_attrs(member, dest_path, for_data=True):
+         if member.islnk() or member.issym():
+             if os.path.isabs(member.linkname):
+                 raise AbsoluteLinkError(member)
+-            target_path = os.path.realpath(os.path.join(dest_path, member.linkname))
++            if member.issym():
++                target_path = os.path.join(dest_path,
++                                           os.path.dirname(name),
++                                           member.linkname)
++            else:
++                target_path = os.path.join(dest_path,
++                                           member.linkname)
++            target_path = os.path.realpath(target_path)
+             if os.path.commonpath([target_path, dest_path]) != dest_path:
+                 raise LinkOutsideDestinationError(member, target_path)
+     return new_attrs
+diff --git a/Lib/test/test_tarfile.py b/Lib/test/test_tarfile.py
+index 2eda7fc4cea..79fc35c2895 100644
+--- a/Lib/test/test_tarfile.py
++++ b/Lib/test/test_tarfile.py
+@@ -3337,10 +3337,12 @@ def __exit__(self, *exc):
+         self.bio = None
+ 
+     def add(self, name, *, type=None, symlink_to=None, hardlink_to=None,
+-            mode=None, **kwargs):
++            mode=None, size=None, **kwargs):
+         """Add a member to the test archive. Call within `with`."""
+         name = str(name)
+         tarinfo = tarfile.TarInfo(name).replace(**kwargs)
++        if size is not None:
++            tarinfo.size = size
+         if mode:
+             tarinfo.mode = _filemode_to_int(mode)
+         if symlink_to is not None:
+@@ -3416,7 +3418,8 @@ def check_context(self, tar, filter):
+                 raise self.raised_exception
+             self.assertEqual(self.expected_paths, set())
+ 
+-    def expect_file(self, name, type=None, symlink_to=None, mode=None):
++    def expect_file(self, name, type=None, symlink_to=None, mode=None,
++                    size=None):
+         """Check a single file. See check_context."""
+         if self.raised_exception:
+             raise self.raised_exception
+@@ -3445,6 +3448,8 @@ def expect_file(self, name, type=None, symlink_to=None, mode=None):
+             self.assertTrue(path.is_fifo())
+         else:
+             raise NotImplementedError(type)
++        if size is not None:
++            self.assertEqual(path.stat().st_size, size)
+         for parent in path.parents:
+             self.expected_paths.discard(parent)
+ 
+@@ -3649,6 +3654,22 @@ def test_sly_relative2(self):
+                     + """['"].*moo['"], which is outside the """
+                     + "destination")
+ 
++    def test_deep_symlink(self):
++        with ArchiveMaker() as arc:
++            arc.add('targetdir/target', size=3)
++            arc.add('linkdir/hardlink', hardlink_to='targetdir/target')
++            arc.add('linkdir/symlink', symlink_to='../targetdir/target')
++
++        for filter in 'tar', 'data', 'fully_trusted':
++            with self.check_context(arc.open(), filter):
++                self.expect_file('targetdir/target', size=3)
++                self.expect_file('linkdir/hardlink', size=3)
++                if support.can_symlink():
++                    self.expect_file('linkdir/symlink', size=3,
++                                     symlink_to='../targetdir/target')
++                else:
++                    self.expect_file('linkdir/symlink', size=3)
++
+     def test_modes(self):
+         # Test how file modes are extracted
+         # (Note that the modes are ignored on platforms without working chmod)
+-- 
+2.41.0
+
+From dc84087083c5ad99a5016e8349c96d9654a08f46 Mon Sep 17 00:00:00 2001
+From: Petr Viktorin <encukou@gmail.com>
+Date: Mon, 6 Mar 2023 17:24:24 +0100
+Subject: [PATCH 2/2] CVE-2007-4559, PEP-706: Add filters for tarfile
+ extraction (downstream)
+
+Add and test RHEL-specific ways of configuring the default behavior: environment
+variable and config file.
+---
+ Lib/tarfile.py           |  42 +++++++++++++
+ Lib/test/test_shutil.py  |   3 +-
+ Lib/test/test_tarfile.py | 124 ++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 165 insertions(+), 4 deletions(-)
+
+diff --git a/Lib/tarfile.py b/Lib/tarfile.py
+index 5291622ab8e..12ab00d748a 100755
+--- a/Lib/tarfile.py
++++ b/Lib/tarfile.py
+@@ -72,6 +72,13 @@ __all__ = ["TarFile", "TarInfo", "is_tarfile", "TarError", "ReadError",
+            "ENCODING", "USTAR_FORMAT", "GNU_FORMAT", "PAX_FORMAT",
+            "DEFAULT_FORMAT", "open"]
+ 
++# If true, use the safer (but backwards-incompatible) 'tar' extraction filter,
++# rather than 'fully_trusted', by default.
++# The emitted warning is changed to match.
++_RH_SAFER_DEFAULT = True
++
++# System-wide configuration file
++_CONFIG_FILENAME = '/etc/python/tarfile.cfg'
+ 
+ #---------------------------------------------------------
+ # tar constants
+@@ -2188,6 +2195,41 @@ class TarFile(object):
+         if filter is None:
+             filter = self.extraction_filter
+             if filter is None:
++                name = os.environ.get('PYTHON_TARFILE_EXTRACTION_FILTER')
++                if name is None:
++                    try:
++                        file = bltn_open(_CONFIG_FILENAME)
++                    except FileNotFoundError:
++                        pass
++                    else:
++                        import configparser
++                        conf = configparser.ConfigParser(
++                            interpolation=None,
++                            comment_prefixes=('#', ),
++                        )
++                        with file:
++                            conf.read_file(file)
++                        name = conf.get('tarfile',
++                                        'PYTHON_TARFILE_EXTRACTION_FILTER',
++                                        fallback='')
++                if name:
++                    try:
++                        filter = _NAMED_FILTERS[name]
++                    except KeyError:
++                        raise ValueError(f"filter {filter!r} not found") from None
++                    self.extraction_filter = filter
++                    return filter
++                if _RH_SAFER_DEFAULT:
++                    warnings.warn(
++                        'The default behavior of tarfile extraction has been '
++                        + 'changed to disallow common exploits '
++                        + '(including CVE-2007-4559). '
++                        + 'By default, absolute/parent paths are disallowed '
++                        + 'and some mode bits are cleared. '
++                        + 'See https://access.redhat.com/articles/7004769 '
++                        + 'for more details.',
++                        RuntimeWarning)
++                    return tar_filter
+                 return fully_trusted_filter
+             if isinstance(filter, str):
+                 raise TypeError(
+diff --git a/Lib/test/test_shutil.py b/Lib/test/test_shutil.py
+index 5cef59ea9c6..73fffe0fd33 100644
+--- a/Lib/test/test_shutil.py
++++ b/Lib/test/test_shutil.py
+@@ -1494,7 +1494,8 @@ class TestShutil(unittest.TestCase):
+     def check_unpack_tarball(self, format):
+         self.check_unpack_archive(format, filter='fully_trusted')
+         self.check_unpack_archive(format, filter='data')
+-        with support.check_no_warnings(self):
++        with support.check_warnings(
++                ('.*CVE-2007-4559', RuntimeWarning)):
+             self.check_unpack_archive(format)
+ 
+     def test_unpack_archive_tar(self):
+diff --git a/Lib/test/test_tarfile.py b/Lib/test/test_tarfile.py
+index 03be10b1fee..15df6a9ced6 100644
+--- a/Lib/test/test_tarfile.py
++++ b/Lib/test/test_tarfile.py
+@@ -2,7 +2,7 @@
+ import os
+ import io
+ from hashlib import sha256
+-from contextlib import contextmanager
++from contextlib import contextmanager, ExitStack
+ from random import Random
+ import pathlib
+ import shutil
+@@ -2744,7 +2744,11 @@ class NoneInfoExtractTests(ReadTest):
+         tar = tarfile.open(tarname, mode='r', encoding="iso8859-1")
+         cls.control_dir = pathlib.Path(TEMPDIR) / "extractall_ctrl"
+         tar.errorlevel = 0
+-        tar.extractall(cls.control_dir, filter=cls.extraction_filter)
++        with ExitStack() as cm:
++            if cls.extraction_filter is None:
++                cm.enter_context(warnings.catch_warnings())
++                warnings.simplefilter(action="ignore", category=RuntimeWarning)
++            tar.extractall(cls.control_dir, filter=cls.extraction_filter)
+         tar.close()
+         cls.control_paths = set(
+             p.relative_to(cls.control_dir)
+@@ -3407,7 +3411,8 @@ class TestExtractionFilters(unittest.TestCase):
+         """Ensure the default filter does not warn (like in 3.12)"""
+         with ArchiveMaker() as arc:
+             arc.add('foo')
+-        with support.check_no_warnings(self):
++        with support.check_warnings(
++                ('.*CVE-2007-4559', RuntimeWarning)):
+             with self.check_context(arc.open(), None):
+                 self.expect_file('foo')
+ 
+@@ -3577,6 +3582,119 @@ class TestExtractionFilters(unittest.TestCase):
+             self.expect_exception(TypeError)  # errorlevel is not int
+ 
+ 
++    @contextmanager
++    def rh_config_context(self, config_lines=None):
++        """Set up for testing various ways of overriding the default filter
++
++        return a triple with:
++        - temporary directory
++        - EnvironmentVarGuard()
++        - a test archive for use with check_* methods below
++
++        If config_lines is given, write them to the config file. Otherwise
++        the config file is missing.
++        """
++        tempdir = pathlib.Path(TEMPDIR) / 'tmp'
++        configfile = tempdir / 'tarfile.cfg'
++        with ArchiveMaker() as arc:
++            arc.add('good')
++            arc.add('ugly', symlink_to='/etc/passwd')
++            arc.add('../bad')
++        with ExitStack() as cm:
++            cm.enter_context(support.temp_dir(tempdir))
++            cm.enter_context(support.swap_attr(tarfile, '_CONFIG_FILENAME', str(configfile)))
++            env = cm.enter_context(support.EnvironmentVarGuard())
++            tar = cm.enter_context(arc.open())
++            if config_lines is not None:
++                with configfile.open('w') as f:
++                    for line in config_lines:
++                        print(line, file=f)
++            yield tempdir, env, tar
++
++    def check_rh_default_behavior(self, tar, tempdir):
++        """Check RH default: warn and refuse to extract dangerous files."""
++        with ExitStack() as cm:
++            cm.enter_context(support.check_warnings(
++                    ('.*CVE-2007-4559', RuntimeWarning)))
++            cm.enter_context(self.assertRaises(tarfile.OutsideDestinationError))
++            tar.extractall(tempdir / 'outdir')
++
++    def check_trusted_default(self, tar, tempdir):
++        """Check 'fully_trusted' is configured as the default filter."""
++        with support.check_no_warnings(self):
++            tar.extractall(tempdir / 'outdir')
++            self.assertTrue((tempdir / 'outdir/good').exists())
++            self.assertEqual(os.readlink(str(tempdir / 'outdir/ugly')),
++                             '/etc/passwd')
++            self.assertTrue((tempdir / 'bad').exists())
++
++    def test_rh_default_no_conf(self):
++        with self.rh_config_context() as (tempdir, env, tar):
++            self.check_rh_default_behavior(tar, tempdir)
++
++    def test_rh_default_from_file(self):
++        lines = ['[tarfile]', 'PYTHON_TARFILE_EXTRACTION_FILTER=fully_trusted']
++        with self.rh_config_context(lines) as (tempdir, env, tar):
++            self.check_trusted_default(tar, tempdir)
++
++    def test_rh_empty_config_file(self):
++        """Empty config file -> default behavior"""
++        lines = []
++        with self.rh_config_context(lines) as (tempdir, env, tar):
++            self.check_rh_default_behavior(tar, tempdir)
++
++    def test_empty_config_section(self):
++        """Empty section in config file -> default behavior"""
++        lines = ['[tarfile]']
++        with self.rh_config_context(lines) as (tempdir, env, tar):
++            self.check_rh_default_behavior(tar, tempdir)
++
++    def test_rh_default_empty_config_option(self):
++        """Empty option value in config file -> default behavior"""
++        lines = ['[tarfile]', 'PYTHON_TARFILE_EXTRACTION_FILTER=']
++        with self.rh_config_context(lines) as (tempdir, env, tar):
++            self.check_rh_default_behavior(tar, tempdir)
++
++    def test_bad_config_option(self):
++        """Bad option value in config file -> ValueError"""
++        lines = ['[tarfile]', 'PYTHON_TARFILE_EXTRACTION_FILTER=unknown!']
++        with self.rh_config_context(lines) as (tempdir, env, tar):
++            with self.assertRaises(ValueError):
++                tar.extractall(tempdir / 'outdir')
++
++    def test_default_from_envvar(self):
++        with self.rh_config_context() as (tempdir, env, tar):
++            env['PYTHON_TARFILE_EXTRACTION_FILTER'] = 'fully_trusted'
++            self.check_trusted_default(tar, tempdir)
++
++    def test_empty_envvar(self):
++        """Empty env variable -> default behavior"""
++        with self.rh_config_context() as (tempdir, env, tar):
++            env['PYTHON_TARFILE_EXTRACTION_FILTER'] = ''
++            self.check_rh_default_behavior(tar, tempdir)
++
++    def test_bad_envvar(self):
++        with self.rh_config_context() as (tempdir, env, tar):
++            env['PYTHON_TARFILE_EXTRACTION_FILTER'] = 'unknown!'
++            with self.assertRaises(ValueError):
++                tar.extractall(tempdir / 'outdir')
++
++    def test_envvar_overrides_file(self):
++        lines = ['[tarfile]', 'PYTHON_TARFILE_EXTRACTION_FILTER=data']
++        with self.rh_config_context(lines) as (tempdir, env, tar):
++            env['PYTHON_TARFILE_EXTRACTION_FILTER'] = 'fully_trusted'
++            self.check_trusted_default(tar, tempdir)
++
++    def test_monkeypatch_overrides_envvar(self):
++        with self.rh_config_context(None) as (tempdir, env, tar):
++            env['PYTHON_TARFILE_EXTRACTION_FILTER'] = 'data'
++            with support.swap_attr(
++                    tarfile.TarFile, 'extraction_filter',
++                    staticmethod(tarfile.fully_trusted_filter)
++            ):
++                self.check_trusted_default(tar, tempdir)
++
++
+ def setUpModule():
+     support.unlink(TEMPDIR)
+     os.makedirs(TEMPDIR)
+-- 
+2.41.0
+
